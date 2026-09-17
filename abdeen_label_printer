@@ -1,0 +1,895 @@
+package com.example.abdeenbarcodeprinter
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.AlertDialog
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothSocket
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.text.Editable
+import android.text.InputType
+import android.text.TextWatcher
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Button
+import android.widget.EditText
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.MultiFormatWriter
+import com.journeyapps.barcodescanner.CaptureActivity
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import org.apache.poi.ss.usermodel.Cell
+import org.apache.poi.ss.usermodel.CellType
+import org.apache.poi.xssf.usermodel.XSSFWorkbook
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.UUID
+
+data class ProductInfo(
+    val description: String,
+    val price: String
+)
+
+data class ProductLabel(
+    val barcode: String,
+    val description: String,
+    val price: String,
+    var quantity: Int = 1
+)
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var tvStatus: TextView
+    private lateinit var recyclerView: RecyclerView
+    private lateinit var etManualBarcode: EditText
+
+    private val labelList = mutableListOf<ProductLabel>()
+    private lateinit var adapter: LabelAdapter
+
+    private val masterCatalog = mutableMapOf<String, ProductInfo>()
+
+    // Bluetooth variables
+    private var bluetoothAdapter: BluetoothAdapter? = null
+    private var bluetoothSocket: BluetoothSocket? = null
+    private var selectedDeviceName: String = "Not Connected"
+    private val PORT_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+
+    private val PREF_NAME = "AbdeenPrinterPrefs"
+    private val KEY_MASTER = "master_catalog_json"
+    private val KEY_BATCH = "active_batch_json"
+    private val KEY_PRINTER_MAC = "printer_mac"
+    
+    // Separate Offset Keys for With Price vs Without Price
+    private val KEY_OFFSET_X_PRICE = "print_offset_x_price"
+    private val KEY_OFFSET_Y_PRICE = "print_offset_y_price"
+    private val KEY_OFFSET_X_NOPRICE = "print_offset_x_noprice"
+    private val KEY_OFFSET_Y_NOPRICE = "print_offset_y_noprice"
+
+    // Admin Password for Print Calibration Settings
+    private val ADMIN_PIN = "1234"
+
+    // CLOUD MASTER URL (3 Columns: Barcode, Description, Price):
+    private val CLOUD_MASTER_URL = "https://docs.google.com/spreadsheets/d/1b-yylbAr7zDlYczl0NE7sWG7JzEQB0SYcPlDPz_uM4o/export?format=csv"
+
+    private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            result.data?.data?.let { uri ->
+                loadBatchExcel(uri)
+            }
+        }
+    }
+
+    private val barcodeScannerLauncher = registerForActivityResult(ScanContract()) { result ->
+        if (result.contents != null) {
+            val scannedBarcode = result.contents.trim()
+            handleScannedBarcode(scannedBarcode)
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        tvStatus = findViewById(R.id.tvStatus)
+        recyclerView = findViewById(R.id.recyclerViewLabels)
+        etManualBarcode = findViewById(R.id.etManualBarcode)
+        recyclerView.layoutManager = LinearLayoutManager(this)
+
+        // Load persisted data on startup
+        loadMasterCatalogFromPrefs()
+        loadBatchFromPrefs()
+
+        // Check for online app updates on startup
+        checkForAppUpdates()
+
+        adapter = LabelAdapter(labelList) { position, newQty ->
+            labelList[position].quantity = newQty
+            saveBatchToPrefs()
+            updateStatusText()
+        }
+        recyclerView.adapter = adapter
+
+        val bluetoothManager = getSystemService(BluetoothManager::class.java)
+        bluetoothAdapter = bluetoothManager?.adapter
+
+        // Attempt to auto-connect last used printer
+        tryAutoConnectPrinter()
+
+        findViewById<Button>(R.id.btnSelectPrinter).setOnClickListener {
+            showBluetoothDevicesDialog()
+        }
+
+        // Clicking Master File syncs live from the Cloud URL
+        findViewById<Button>(R.id.btnLoadMaster).setOnClickListener {
+            if (CLOUD_MASTER_URL.startsWith("http")) {
+                syncMasterCatalogFromCloud()
+            } else {
+                Toast.makeText(this, "Please configure your Cloud Master URL in code first!", Toast.LENGTH_LONG).show()
+            }
+        }
+
+        // Settings Button with Password Check
+        findViewById<Button>(R.id.btnSettings).setOnClickListener {
+            showPasswordPromptDialog()
+        }
+
+        findViewById<Button>(R.id.btnSelectFile).setOnClickListener {
+            openFilePicker()
+        }
+
+        findViewById<Button>(R.id.btnScanCamera).setOnClickListener {
+            if (masterCatalog.isEmpty()) {
+                Toast.makeText(this, "Please sync Master Catalog first!", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+            startCameraScanner()
+        }
+
+        findViewById<Button>(R.id.btnManualAdd).setOnClickListener {
+            val query = etManualBarcode.text.toString().trim()
+            if (query.isNotEmpty()) {
+                if (masterCatalog.isEmpty()) {
+                    Toast.makeText(this, "Please sync Master Catalog first!", Toast.LENGTH_LONG).show()
+                } else {
+                    searchAndAddProduct(query)
+                    etManualBarcode.setText("")
+                }
+            }
+        }
+
+        findViewById<Button>(R.id.btnClearAll).setOnClickListener {
+            AlertDialog.Builder(this)
+                .setTitle("Clear Batch")
+                .setMessage("Are you sure you want to clear all items?")
+                .setPositiveButton("Yes") { _, _ ->
+                    labelList.clear()
+                    adapter.notifyDataSetChanged()
+                    saveBatchToPrefs()
+                    updateStatusText()
+                }
+                .setNegativeButton("No", null)
+                .show()
+        }
+
+        findViewById<Button>(R.id.btnResetQty).setOnClickListener {
+            for (item in labelList) {
+                item.quantity = 1
+            }
+            adapter.notifyDataSetChanged()
+            saveBatchToPrefs()
+            updateStatusText()
+            Toast.makeText(this, "All quantities reset to 1", Toast.LENGTH_SHORT).show()
+        }
+
+        // Standard Label Print Buttons
+        findViewById<Button>(R.id.btnPrintWithPrice).setOnClickListener {
+            printBatchLabels(includePrice = true)
+        }
+
+        findViewById<Button>(R.id.btnPrintWithoutPrice).setOnClickListener {
+            printBatchLabels(includePrice = false)
+        }
+
+        updateStatusText()
+    }
+
+    // --- Over-The-Air (OTA) Update Logic ---
+
+    private fun checkForAppUpdates() {
+        val currentVersionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageManager.getPackageInfo(packageName, 0).longVersionCode.toInt()
+        } else {
+            @Suppress("DEPRECATION")
+            packageManager.getPackageInfo(packageName, 0).versionCode
+        }
+
+        Thread {
+            try {
+                // Replace with your raw text link to version.txt
+                val versionUrl = URL("https://yourdomain.com/version.txt")
+                val remoteVersion = versionUrl.readText().trim().toIntOrNull() ?: return@Thread
+
+                if (remoteVersion > currentVersionCode) {
+                    runOnUiThread {
+                        AlertDialog.Builder(this)
+                            .setTitle("Update Available")
+                            .setMessage("A new version of Abdeen Grand Store app is available. Would you like to update now?")
+                            .setPositiveButton("Update") { _, _ ->
+                                downloadAndInstallUpdate("https://yourdomain.com/app-release.apk")
+                            }
+                            .setNegativeButton("Later", null)
+                            .show()
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }.start()
+    }
+
+    private fun downloadAndInstallUpdate(apkUrl: String) {
+        Toast.makeText(this, "Downloading update...", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val url = URL(apkUrl)
+                val connection = url.openConnection() as HttpURLConnection
+                connection.connect()
+
+                val input = connection.inputStream
+                val outputFile = java.io.File(cacheDir, "update.apk")
+                val output = java.io.FileOutputStream(outputFile)
+
+                val data = ByteArray(1024)
+                var count: Int
+                while (input.read(data).also { count = it } != -1) {
+                    output.write(data, 0, count)
+                }
+                output.flush()
+                output.close()
+                input.close()
+
+                runOnUiThread {
+                    promptInstall(outputFile)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                runOnUiThread {
+                    Toast.makeText(this, "Download failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun promptInstall(file: java.io.File) {
+        val apkUri = androidx.core.content.FileProvider.getUriForFile(
+            this,
+            "${packageName}.fileprovider",
+            file
+        )
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(apkUri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        startActivity(intent)
+    }
+
+    // --- Password & Separate Calibration Settings Dialogs ---
+
+    private fun showPasswordPromptDialog() {
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            hint = "Enter Admin PIN"
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(50, 20, 50, 10)
+            addView(input)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Protected Settings")
+            .setMessage("Enter your PIN to access print positioning:")
+            .setView(container)
+            .setPositiveButton("Unlock") { _, _ ->
+                val enteredPin = input.text.toString().trim()
+                if (enteredPin == ADMIN_PIN) {
+                    showCalibrationSettingsDialog()
+                } else {
+                    Toast.makeText(this, "Incorrect PIN!", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun showCalibrationSettingsDialog() {
+        val prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE)
+        
+        val priceX = prefs.getInt(KEY_OFFSET_X_PRICE, 0)
+        val priceY = prefs.getInt(KEY_OFFSET_Y_PRICE, 0)
+        val noPriceX = prefs.getInt(KEY_OFFSET_X_NOPRICE, 0)
+        val noPriceY = prefs.getInt(KEY_OFFSET_Y_NOPRICE, 0)
+
+        val inputPriceX = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
+            setText(priceX.toString())
+            setTextColor(Color.WHITE)
+        }
+        val inputPriceY = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
+            setText(priceY.toString())
+            setTextColor(Color.WHITE)
+        }
+
+        val inputNoPriceX = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
+            setText(noPriceX.toString())
+            setTextColor(Color.WHITE)
+        }
+        val inputNoPriceY = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
+            setText(noPriceY.toString())
+            setTextColor(Color.WHITE)
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(40, 20, 40, 10)
+            
+            addView(TextView(this@MainActivity).apply { text = "--- Labels With Price ---"; setTextColor(Color.GREEN); textSize = 13f })
+            addView(TextView(this@MainActivity).apply { text = "X Offset (+ right, - left):"; setTextColor(Color.LTGRAY); textSize = 11f })
+            addView(inputPriceX)
+            addView(TextView(this@MainActivity).apply { text = "Y Offset (+ down, - up):"; setTextColor(Color.LTGRAY); textSize = 11f })
+            addView(inputPriceY)
+
+            addView(TextView(this@MainActivity).apply { text = "\n--- Labels Without Price ---"; setTextColor(Color.CYAN); textSize = 13f })
+            addView(TextView(this@MainActivity).apply { text = "X Offset (+ right, - left):"; setTextColor(Color.LTGRAY); textSize = 11f })
+            addView(inputNoPriceX)
+            addView(TextView(this@MainActivity).apply { text = "Y Offset (+ down, - up):"; setTextColor(Color.LTGRAY); textSize = 11f })
+            addView(inputNoPriceY)
+        }
+
+        val scrollView = ScrollView(this).apply {
+            addView(container)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Separate Print Alignments")
+            .setView(scrollView)
+            .setPositiveButton("Save") { _, _ ->
+                val newPX = inputPriceX.text.toString().toIntOrNull() ?: 0
+                val newPY = inputPriceY.text.toString().toIntOrNull() ?: 0
+                val newNPX = inputNoPriceX.text.toString().toIntOrNull() ?: 0
+                val newNPY = inputNoPriceY.text.toString().toIntOrNull() ?: 0
+
+                prefs.edit()
+                    .putInt(KEY_OFFSET_X_PRICE, newPX)
+                    .putInt(KEY_OFFSET_Y_PRICE, newPY)
+                    .putInt(KEY_OFFSET_X_NOPRICE, newNPX)
+                    .putInt(KEY_OFFSET_Y_NOPRICE, newNPY)
+                    .apply()
+
+                Toast.makeText(this, "Alignment settings saved separately!", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // --- Cloud Sync for Master Catalog ---
+
+    private fun syncMasterCatalogFromCloud() {
+        Toast.makeText(this, "Syncing Master Catalog from cloud...", Toast.LENGTH_SHORT).show()
+
+        Thread {
+            try {
+                val url = URL(CLOUD_MASTER_URL)
+                val connection = url.openConnection() as HttpURLConnection
+                connection.requestMethod = "GET"
+                connection.connectTimeout = 10000
+                connection.readTimeout = 10000
+
+                if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+                    val reader = BufferedReader(InputStreamReader(connection.inputStream))
+                    val newCatalog = mutableMapOf<String, ProductInfo>()
+                    var line: String?
+                    var isFirstLine = true
+
+                    while (reader.readLine().also { line = it } != null) {
+                        if (isFirstLine) {
+                            isFirstLine = false
+                            continue
+                        }
+
+                        val parts = line!!.split(",")
+                        if (parts.size >= 3) {
+                            val barcode = parts[0].trim().removeSurrounding("\"")
+                            val description = parts[1].trim().removeSurrounding("\"")
+                            val price = parts[2].trim().removeSurrounding("\"")
+
+                            if (barcode.isNotEmpty()) {
+                                newCatalog[barcode] = ProductInfo(description, price)
+                            }
+                        }
+                    }
+                    reader.close()
+
+                    runOnUiThread {
+                        if (newCatalog.isNotEmpty()) {
+                            masterCatalog.clear()
+                            masterCatalog.putAll(newCatalog)
+                            saveMasterCatalogToPrefs()
+                            updateStatusText()
+                            Toast.makeText(this, "Successfully synced ${masterCatalog.size} products from cloud!", Toast.LENGTH_LONG).show()
+                        } else {
+                            Toast.makeText(this, "Cloud sheet appeared empty.", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                } else {
+                    runOnUiThread {
+                        Toast.makeText(this, "Server error: ${connection.responseCode}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                runOnUiThread {
+                    Toast.makeText(this, "Sync failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    // --- Smart Search & Add Function ---
+
+    private fun searchAndAddProduct(query: String) {
+        if (masterCatalog.containsKey(query)) {
+            handleScannedBarcode(query)
+            return
+        }
+
+        val matches = mutableListOf<Pair<String, ProductInfo>>()
+        for ((barcode, info) in masterCatalog) {
+            if (barcode.contains(query, ignoreCase = true) ||
+                info.description.contains(query, ignoreCase = true)) {
+                matches.add(Pair(barcode, info))
+            }
+        }
+
+        when (matches.size) {
+            0 -> Toast.makeText(this, "No products found matching '$query'", Toast.LENGTH_LONG).show()
+            1 -> handleScannedBarcode(matches[0].first)
+            else -> {
+                val displayItems = matches.map { "${it.second.description}\nPrice: ${it.second.price} JD | Code: ${it.first}" }.toTypedArray()
+                AlertDialog.Builder(this)
+                    .setTitle("Select Product (${matches.size} found)")
+                    .setItems(displayItems) { _, which ->
+                        handleScannedBarcode(matches[which].first)
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+        }
+    }
+
+    // --- Persistence Methods ---
+
+    private fun saveMasterCatalogToPrefs() {
+        try {
+            val jsonObject = JSONObject()
+            for ((k, v) in masterCatalog) {
+                val itemObj = JSONObject().apply {
+                    put("description", v.description)
+                    put("price", v.price)
+                }
+                jsonObject.put(k, itemObj)
+            }
+            getSharedPreferences(PREF_NAME, MODE_PRIVATE)
+                .edit().putString(KEY_MASTER, jsonObject.toString()).apply()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun loadMasterCatalogFromPrefs() {
+        val jsonStr = getSharedPreferences(PREF_NAME, MODE_PRIVATE).getString(KEY_MASTER, null) ?: return
+        try {
+            val jsonObject = JSONObject(jsonStr)
+            masterCatalog.clear()
+            for (key in jsonObject.keys()) {
+                val obj = jsonObject.getJSONObject(key)
+                masterCatalog[key] = ProductInfo(
+                    description = obj.getString("description"),
+                    price = obj.getString("price")
+                )
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun saveBatchToPrefs() {
+        try {
+            val jsonArray = JSONArray()
+            for (item in labelList) {
+                val obj = JSONObject().apply {
+                    put("barcode", item.barcode)
+                    put("description", item.description)
+                    put("price", item.price)
+                    put("quantity", item.quantity)
+                }
+                jsonArray.put(obj)
+            }
+            getSharedPreferences(PREF_NAME, MODE_PRIVATE)
+                .edit().putString(KEY_BATCH, jsonArray.toString()).apply()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun loadBatchFromPrefs() {
+        val jsonStr = getSharedPreferences(PREF_NAME, MODE_PRIVATE).getString(KEY_BATCH, null) ?: return
+        try {
+            val jsonArray = JSONArray(jsonStr)
+            labelList.clear()
+            for (i in 0 until jsonArray.length()) {
+                val obj = jsonArray.getJSONObject(i)
+                labelList.add(
+                    ProductLabel(
+                        barcode = obj.getString("barcode"),
+                        description = obj.getString("description"),
+                        price = obj.getString("price"),
+                        quantity = obj.getInt("quantity")
+                    )
+                )
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    // --- Auto-Connect Printer ---
+
+    private fun tryAutoConnectPrinter() {
+        val prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE)
+        val mac = prefs.getString(KEY_PRINTER_MAC, null) ?: return
+        if (bluetoothAdapter == null) return
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                return
+            }
+        }
+
+        try {
+            val device = bluetoothAdapter?.getRemoteDevice(mac)
+            if (device != null) {
+                Thread {
+                    try {
+                        bluetoothSocket?.close()
+                        val socket = device.createRfcommSocketToServiceRecord(PORT_UUID)
+                        socket.connect()
+                        bluetoothSocket = socket
+                        selectedDeviceName = device.name ?: "Printer"
+                        runOnUiThread {
+                            updateStatusText()
+                            Toast.makeText(this, "Auto-connected to $selectedDeviceName", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }.start()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun showBluetoothDevicesDialog() {
+        if (bluetoothAdapter == null) {
+            Toast.makeText(this, "Bluetooth not supported on this device", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN), 101)
+                return
+            }
+        }
+
+        val pairedDevices: Set<BluetoothDevice>? = bluetoothAdapter?.bondedDevices
+        if (pairedDevices.isNullOrEmpty()) {
+            Toast.makeText(this, "No paired Bluetooth printers found.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val deviceList = pairedDevices.toList()
+        val deviceNames = deviceList.map { "${it.name}\n${it.address}" }.toTypedArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Select Bluetooth Printer")
+            .setItems(deviceNames) { _, which ->
+                connectToPrinter(deviceList[which])
+            }
+            .show()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectToPrinter(device: BluetoothDevice) {
+        try {
+            bluetoothSocket?.close()
+            val socket = device.createRfcommSocketToServiceRecord(PORT_UUID)
+            socket.connect()
+            bluetoothSocket = socket
+            selectedDeviceName = device.name ?: "Printer"
+
+            getSharedPreferences(PREF_NAME, MODE_PRIVATE).edit().putString(KEY_PRINTER_MAC, device.address).apply()
+
+            updateStatusText()
+            Toast.makeText(this, "Connected to $selectedDeviceName!", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "Connection failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun openFilePicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        }
+        filePickerLauncher.launch(intent)
+    }
+
+    private fun startCameraScanner() {
+        val options = ScanOptions().apply {
+            setPrompt("Scan barcode from sheet")
+            setBeepEnabled(true)
+            setOrientationLocked(false)
+            captureActivity = CaptureActivity::class.java
+        }
+        barcodeScannerLauncher.launch(options)
+    }
+
+    private fun handleScannedBarcode(scannedCode: String) {
+        val existingIndex = labelList.indexOfFirst { it.barcode == scannedCode }
+        if (existingIndex != -1) {
+            labelList[existingIndex].quantity += 1
+            adapter.notifyItemChanged(existingIndex)
+            recyclerView.scrollToPosition(existingIndex)
+            saveBatchToPrefs()
+            updateStatusText()
+            Toast.makeText(this, "Incremented quantity for: $scannedCode", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val productInfo = masterCatalog[scannedCode]
+        if (productInfo != null) {
+            val newLabel = ProductLabel(
+                barcode = scannedCode,
+                description = productInfo.description,
+                price = productInfo.price,
+                quantity = 1
+            )
+            labelList.add(newLabel)
+            adapter.notifyItemInserted(labelList.size - 1)
+            recyclerView.scrollToPosition(labelList.size - 1)
+            saveBatchToPrefs()
+            updateStatusText()
+            Toast.makeText(this, "Added new item from Master Catalog!", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Barcode $scannedCode NOT found in Master Catalog!", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun getCellString(cell: Cell?): String {
+        if (cell == null) return ""
+        return when (cell.cellType) {
+            CellType.STRING -> cell.stringCellValue.trim()
+            CellType.NUMERIC -> {
+                val value = cell.numericCellValue
+                if (value == value.toLong().toDouble()) {
+                    value.toLong().toString()
+                } else {
+                    value.toString()
+                }
+            }
+            CellType.BOOLEAN -> cell.booleanCellValue.toString()
+            else -> cell.toString().trim()
+        }
+    }
+
+    private fun loadBatchExcel(uri: Uri) {
+        try {
+            val inputStream: InputStream? = contentResolver.openInputStream(uri)
+            val workbook = XSSFWorkbook(inputStream)
+            val sheet = workbook.getSheetAt(0)
+
+            labelList.clear()
+            for (i in 0..sheet.lastRowNum) {
+                val row = sheet.getRow(i) ?: continue
+                val barcodeVal = getCellString(row.getCell(0))
+                val description = getCellString(row.getCell(1))
+                val price = getCellString(row.getCell(2))
+
+                if (i == 0 && (barcodeVal.equals("Barcode", ignoreCase = true) ||
+                            barcodeVal.equals("Code", ignoreCase = true) ||
+                            barcodeVal.equals("Item", ignoreCase = true))) {
+                    continue
+                }
+
+                if (barcodeVal.isNotEmpty()) {
+                    labelList.add(ProductLabel(barcodeVal, description, price, 1))
+                }
+            }
+
+            workbook.close()
+            inputStream?.close()
+
+            adapter.notifyDataSetChanged()
+            saveBatchToPrefs()
+            updateStatusText()
+            Toast.makeText(this, "Batch loaded with ${labelList.size} items", Toast.LENGTH_SHORT).show()
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+            tvStatus.text = "Error loading Batch: ${e.localizedMessage}"
+        }
+    }
+
+    private fun updateStatusText() {
+        val batchCount = labelList.sumOf { it.quantity }
+        tvStatus.text = "Printer: $selectedDeviceName | Batch: $batchCount labels"
+    }
+
+    // --- Standard 50x25mm Label Printing ---
+    private fun printBatchLabels(includePrice: Boolean) {
+        if (bluetoothSocket == null || !bluetoothSocket!!.isConnected) {
+            Toast.makeText(this, "Select and connect a Bluetooth printer first!", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (labelList.isEmpty()) {
+            Toast.makeText(this, "No labels to print in batch", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE)
+        val offsetX: Int
+        val offsetY: Int
+
+        if (includePrice) {
+            offsetX = prefs.getInt(KEY_OFFSET_X_PRICE, 0)
+            offsetY = prefs.getInt(KEY_OFFSET_Y_PRICE, 0)
+        } else {
+            offsetX = prefs.getInt(KEY_OFFSET_X_NOPRICE, 0)
+            offsetY = prefs.getInt(KEY_OFFSET_Y_NOPRICE, 0)
+        }
+
+        try {
+            val outputStream = bluetoothSocket!!.outputStream
+
+            for (item in labelList) {
+                val tspl = StringBuilder().apply {
+                    append("SIZE 50 mm, 25 mm\n")
+                    append("GAP 2 mm, 0 mm\n")
+                    append("CLS\n")
+
+                    if (includePrice && item.price.isNotEmpty()) {
+                        append("BLOCK ${165 + offsetX}, ${3 + offsetY}, ${310 + offsetX}, ${16 + offsetY}, \"2\", 0, 1, 1, 2, \"ABDEEN GRAND STORES\"\n")
+                        append("BLOCK ${180 + offsetX}, ${21 + offsetY}, ${310 + offsetX}, ${42 + offsetY}, \"1\", 0, 1, 1, 2, \"${item.description}\"\n")
+                        append("BARCODE ${180 + offsetX}, ${58 + offsetY}, \"128\", 30, 1, 0, 2, 2, \"${item.barcode}\"\n")
+                        append("BLOCK ${140 + offsetX}, ${125 + offsetY}, ${340 + offsetX}, ${50 + offsetY}, \"2\", 0, 2, 2, 2, \"  ${item.price} JD\"\n")
+                    } else {
+                        append("BLOCK ${165 + offsetX}, ${6 + offsetY}, ${310 + offsetX}, ${16 + offsetY}, \"2\", 0, 1, 1, 2, \"ABDEEN GRAND STORES\"\n")
+                        append("BLOCK ${180 + offsetX}, ${26 + offsetY}, ${310 + offsetX}, ${85 + offsetY}, \"2\", 0, 1, 1, 2, \"${item.description}\"\n")
+                        append("BARCODE ${180 + offsetX}, ${105 + offsetY}, \"128\", 55, 1, 0, 2, 2, \"${item.barcode}\"\n")
+                    }
+
+                    append("PRINT ${item.quantity},1\n")
+                }
+
+                outputStream.write(tspl.toString().toByteArray())
+                outputStream.flush()
+            }
+
+            Toast.makeText(this, "Standard labels sent successfully!", Toast.LENGTH_LONG).show()
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "Printing error: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+        }
+    }
+}
+
+class LabelAdapter(
+    private val items: List<ProductLabel>,
+    private val onQuantityChanged: (Int, Int) -> Unit
+) : RecyclerView.Adapter<LabelAdapter.LabelViewHolder>() {
+
+    class LabelViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+        val imgPreview: ImageView = view.findViewById(R.id.imgPreview)
+        val tvDescription: TextView = view.findViewById(R.id.tvDescription)
+        val tvPrice: TextView = view.findViewById(R.id.tvPrice)
+        val tvBarcodeDigits: TextView = view.findViewById(R.id.tvBarcodeDigits)
+        val etQuantity: EditText = view.findViewById(R.id.etQuantity)
+    }
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): LabelViewHolder {
+        val view = LayoutInflater.from(parent.context).inflate(R.layout.item_label, parent, false)
+        return LabelViewHolder(view)
+    }
+
+    override fun onBindViewHolder(holder: LabelViewHolder, position: Int) {
+        val item = items[position]
+        holder.tvDescription.text = item.description
+        holder.tvPrice.text = "Price: ${item.price}"
+        holder.tvBarcodeDigits.text = item.barcode
+        holder.etQuantity.setText(item.quantity.toString())
+
+        try {
+            val width = 450
+            val height = 120
+            val bitMatrix = MultiFormatWriter().encode(item.barcode, BarcodeFormat.CODE_128, width, height)
+            val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
+            for (x in 0 until width) {
+                for (y in 0 until height) {
+                    bmp.setPixel(x, y, if (bitMatrix[x, y]) Color.BLACK else Color.WHITE)
+                }
+            }
+            holder.imgPreview.setImageBitmap(bmp)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        if (holder.etQuantity.tag is TextWatcher) {
+            holder.etQuantity.removeTextChangedListener(holder.etQuantity.tag as TextWatcher)
+        }
+
+        val watcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                val currentPosition = holder.bindingAdapterPosition
+                if (currentPosition != RecyclerView.NO_POSITION) {
+                    val qty = s.toString().toIntOrNull() ?: 1
+                    onQuantityChanged(currentPosition, qty)
+                }
+            }
+        }
+        holder.etQuantity.tag = watcher
+        holder.etQuantity.addTextChangedListener(watcher)
+    }
+
+    override fun getItemCount() = items.size
+}
